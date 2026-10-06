@@ -1,0 +1,15 @@
+services:
+  acc-control-web:
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+    container_name: acc-control-web
+    ports:
+      - "5000:5000"
+    privileged: true
+    environment:
+      DBUS_SYSTEM_BUS_ADDRESS: unix:path=/run/dbus/system_bus_socket
+    volumes:
+      - ./backend/measured_data:/app/backend/measured_data
+      - /run/dbus:/run/dbus:ro
+    restart: unless-stopped

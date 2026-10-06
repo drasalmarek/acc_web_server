@@ -1,0 +1,471 @@
+
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+    <meta charset="UTF-8">
+    <title>Accelerometer Control</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Space+Grotesk:wght@400;500;600;700&display=swap');
+
+        :root {
+            --ink: #18212b;
+            --muted: #6b7785;
+            --paper: #f4f1ea;
+            --panel: #fffdf8;
+            --line: #d9d5cc;
+            --accent: #e4572e;
+            --accent-dark: #b63c1e;
+            --mint: #d8efe5;
+            --terminal: #172329;
+        }
+
+        * { box-sizing: border-box; }
+
+        body {
+            margin: 0;
+            padding: 36px clamp(18px, 5vw, 76px) 64px;
+            color: var(--ink);
+            background: radial-gradient(circle at 90% 0%, #f8d8c4 0, transparent 28%), var(--paper);
+            font-family: 'Space Grotesk', sans-serif;
+            line-height: 1.45;
+        }
+
+        body::before {
+            content: "";
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            opacity: .28;
+            background-image: linear-gradient(#d9d5cc 1px, transparent 1px), linear-gradient(90deg, #d9d5cc 1px, transparent 1px);
+            background-size: 32px 32px;
+            mask-image: linear-gradient(to bottom, black, transparent 75%);
+        }
+
+        h1, h2, p, pre, ul { position: relative; }
+        h1 {
+            max-width: 1100px;
+            margin: 0 auto 28px;
+            font-size: clamp(2rem, 5vw, 4.5rem);
+            line-height: .95;
+            letter-spacing: -.06em;
+        }
+
+        h1::after {
+            content: "BLE measurement desk";
+            display: block;
+            margin-top: 14px;
+            color: var(--accent);
+            font: 500 .75rem 'DM Mono', monospace;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+        }
+
+        h2 {
+            max-width: 1100px;
+            margin: 26px auto 0;
+            padding: 18px 22px 0;
+            border-top: 1px solid var(--line);
+            font-size: 1.05rem;
+            letter-spacing: .02em;
+        }
+
+        body > select, body > button, body > input, body > label, body > p,
+        body > pre, body > ul, body > br { position: relative; }
+
+        body > select, body > button, body > input, body > label, body > p,
+        body > pre, body > ul { margin-left: auto; margin-right: auto; max-width: 1100px; }
+
+        select, input, button {
+            min-height: 42px;
+            border: 1px solid var(--line);
+            border-radius: 10px;
+            font: inherit;
+        }
+
+        select, input { padding: 8px 12px; background: var(--panel); color: var(--ink); }
+        input { margin: 6px 6px 6px 8px; width: 118px; }
+        input[type="checkbox"] { width: 18px; min-height: 18px; accent-color: var(--accent); vertical-align: middle; }
+        label { display: inline-block; padding: 8px 0; }
+        button { padding: 8px 15px; margin: 6px 6px 6px 0; background: var(--ink); color: #fff; cursor: pointer; transition: transform .15s, background .15s; }
+        button:hover { background: var(--accent); transform: translateY(-2px); }
+        #stopCycle { background: var(--accent); }
+        #stopCycle:hover { background: var(--accent-dark); }
+        button:disabled, input:disabled, select:disabled { cursor: not-allowed; opacity: .5; transform: none; }
+        #status { padding: 10px 14px; color: var(--accent-dark); font: 500 .85rem 'DM Mono', monospace; }
+        #console { min-height: 220px; border: 0; border-radius: 14px; background: var(--terminal); color: #b8f3d1; box-shadow: 0 16px 30px rgba(24, 33, 43, .14); font: .78rem/1.7 'DM Mono', monospace; white-space: pre-wrap; }
+        #configurationFeedback { padding: 15px; border-radius: 12px; background: var(--mint); font: .82rem/1.8 'DM Mono', monospace; white-space: pre-wrap; }
+        .settings-panel { max-width: 760px; margin: 0 auto; padding: 22px; border: 1px solid var(--line); border-radius: 16px; background: rgba(255, 253, 248, .82); box-shadow: 0 14px 28px rgba(24, 33, 43, .07); }
+        .centered-controls { max-width: 760px; margin: 0 auto; text-align: center; }
+        .centered-controls p { margin: 8px auto; }
+        .centered-controls label { margin: 4px 8px; }
+        .sensor-row { display: grid; grid-template-columns: 74px 90px 150px 1fr; gap: 14px; align-items: center; padding: 14px 0; border-bottom: 1px solid var(--line); }
+        .sensor-row:last-of-type { border-bottom: 0; }
+        .sensor-name { font-weight: 700; letter-spacing: .04em; }
+        .sensor-enabled { display: flex; align-items: center; gap: 7px; padding: 0; }
+        .axis-controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+        .axis-controls label { padding: 0; font: .78rem 'DM Mono', monospace; }
+        .settings-actions { margin-top: 18px; }
+        .settings-panel #configurationFeedback { margin: 18px 0 0; }
+        @media (max-width: 650px) {
+            body { padding: 24px 14px 42px; }
+            h1 { font-size: 2.7rem; }
+            input { width: 100px; }
+            .settings-panel { padding: 14px; }
+            .sensor-row { grid-template-columns: 1fr; gap: 6px; }
+        }
+    </style>
+</head>
+<body>
+    <h1>Accelerometer Control</h1>
+
+    <h2>Připojení</h2>
+    <div class="centered-controls">
+        <select id="address" class="cycle-control">
+            {% for address in sensor_addr %}
+                <option value="{{ address }}">{{ address }}</option>
+            {% endfor %}
+        </select>
+        <button class="cycle-control" onclick="connectDevice()">Připojit</button>
+        <p id="status">Odpojeno</p>
+    </div>
+
+    <h2>BLE konzole</h2>
+    <pre id="console" style="height: 240px; overflow-y: auto; background: #111; color: #0f0; padding: 10px;"></pre>
+
+    <h2>Nastavení měření</h2>
+    <div class="settings-panel">
+        <div class="sensor-row">
+            <div class="sensor-name">ADXL</div>
+            <label class="sensor-enabled">
+                <input id="adxlEnabled" class="cycle-control" type="checkbox">
+                ON
+            </label>
+            <select id="adxlRate" class="cycle-control">
+                <option value="100">100 Hz</option>
+                <option value="200">200 Hz</option>
+                <option value="400" selected>400 Hz</option>
+                <option value="800">800 Hz</option>
+                <option value="1600">1600 Hz</option>
+                <option value="3200">3200 Hz</option>
+            </select>
+            <div class="axis-controls">
+                <label><input id="adxlAxisX" class="cycle-control" type="checkbox" data-axis-bit="1"> X</label>
+                <label><input id="adxlAxisY" class="cycle-control" type="checkbox" data-axis-bit="2"> Y</label>
+                <label><input id="adxlAxisZ" class="cycle-control" type="checkbox" data-axis-bit="4"> Z</label>
+                <label><input id="adxlAxisM" class="cycle-control" type="checkbox" data-axis-bit="8"> M</label>
+                <input id="adxlAxes" class="cycle-control" type="hidden" value="0">
+            </div>
+        </div>
+
+        <div class="sensor-row">
+            <div class="sensor-name">BNO</div>
+            <label class="sensor-enabled">
+                <input id="bnoEnabled" class="cycle-control" type="checkbox">
+                ON
+            </label>
+            <input id="bnoRate" class="cycle-control" type="number" value="400" min="1">
+        </div>
+
+        <div class="sensor-row">
+            <div class="sensor-name">ADC</div>
+            <label class="sensor-enabled">
+                <input id="adcEnabled" class="cycle-control" type="checkbox">
+                ON
+            </label>
+            <input id="adcRate" class="cycle-control" type="number" value="10000" min="1">
+        </div>
+
+        <div class="settings-actions">
+            <button class="cycle-control" onclick="configure()">Použít konfiguraci</button>
+            <button class="cycle-control" onclick="refreshConfiguration()">Načíst aktuální konfiguraci</button>
+        </div>
+        <pre id="configurationFeedback">Aktuální konfigurace zatím není načtená.</pre>
+    </div>
+
+    <h2>Stažená měření</h2>
+    <div class="centered-controls">
+        <p id="fileCount">Počet stažených měření: --</p>
+        <a href="/files/download-all" download><button type="button">Stáhnout ZIP CSV dat</button></a>
+    </div>
+
+    <h2>Cyklus měření</h2>
+    <div class="centered-controls">
+        <label>
+            Perioda v hodinách:
+            <input id="period" class="cycle-control" type="number" value="1" min="0.0166667" step="0.0166667">
+        </label>
+        <button class="cycle-control" type="button" onclick="setDebugPeriod()">Nastavit 1 minutu</button>
+
+        <br>
+
+        <label>
+            Délka měření v minutách:
+            <input id="duration" class="cycle-control" type="number" value="1" min="1">
+        </label>
+
+        <br><br>
+        <button class="cycle-control" onclick="startMeasurement()">Spustit cyklus</button>
+        <button id="stopCycle" type="button" onclick="stopMeasurementCycle()" hidden>Zastavit cyklus</button>
+    </div>
+
+    <script>
+    const enabledSensors = {{ enabled_sensors | tojson }};
+
+    async function refreshConsole() {
+        try {
+            const response = await fetch("/logs");
+            const data = await response.json();
+            const consoleElement = document.getElementById("console");
+            const wasAtBottom = consoleElement.scrollTop + consoleElement.clientHeight >= consoleElement.scrollHeight - 20;
+            consoleElement.textContent = data.logs.join("\n");
+            if (wasAtBottom) {
+                consoleElement.scrollTop = consoleElement.scrollHeight;
+            }
+        } catch (error) {
+            console.error("Nelze načíst BLE konzoli:", error);
+        }
+    }
+
+    setInterval(refreshConsole, 1000);
+    refreshConsole();
+
+    async function refreshFileCount() {
+        try {
+            const response = await fetch("/files/count");
+            const data = await response.json();
+            document.getElementById("fileCount").textContent =
+                `Počet stažených měření: ${data.count}`;
+        } catch (error) {
+            document.getElementById("fileCount").textContent = "Počet stažených měření: nedostupný";
+        }
+    }
+
+    setInterval(refreshFileCount, 5000);
+    refreshFileCount();
+
+    async function refreshConfiguration() {
+        try {
+            const response = await fetch("/configuration/refresh", {method: "POST"});
+            const data = await response.json();
+            if (!response.ok) {
+                document.getElementById("configurationFeedback").textContent = data.status;
+            } else {
+                await showConfiguration(true);
+            }
+        } catch (error) {
+            document.getElementById("configurationFeedback").textContent = "Chyba načtení konfigurace.";
+        }
+    }
+
+    async function showConfiguration(updateInputs = false) {
+        try {
+            const response = await fetch("/configuration");
+            const config = await response.json();
+            const lines = Object.entries(config).map(([name, value]) => {
+                if (!value) return `${name}: není načteno`;
+                const axes = value.axes === null ? "" : `, osy=${formatAdxlAxes(value.axes)} (${value.axes})`;
+                return `${name}: ${value.enabled ? "ON" : "OFF"}, ${value.rate} Hz${axes}`;
+            });
+
+            if (updateInputs && config.ADXL) {
+                document.getElementById("adxlEnabled").checked = config.ADXL.enabled;
+                document.getElementById("adxlRate").value = config.ADXL.rate;
+                if (config.ADXL.axes !== null) {
+                    setAdxlAxesMask(config.ADXL.axes);
+                }
+            }
+            if (updateInputs && config.BNO) {
+                document.getElementById("bnoEnabled").checked = config.BNO.enabled;
+                document.getElementById("bnoRate").value = config.BNO.rate;
+            }
+            if (updateInputs && config.ADC) {
+                document.getElementById("adcEnabled").checked = config.ADC.enabled;
+                document.getElementById("adcRate").value = config.ADC.rate;
+            }
+
+            document.getElementById("configurationFeedback").textContent = lines.join("\n");
+        } catch (error) {
+            console.error("Nelze načíst konfiguraci:", error);
+        }
+    }
+
+    setInterval(showConfiguration, 1000);
+    showConfiguration();
+
+    function setCycleControlsDisabled(disabled) {
+        document.querySelectorAll(".cycle-control").forEach((element) => {
+            element.disabled = disabled;
+        });
+        if (!disabled) {
+            applySensorAccess();
+        }
+    }
+
+    function applySensorAccess() {
+        const sensorControlIds = {
+            ADXL: ["adxlEnabled", "adxlRate", "adxlAxes", "adxlAxisX", "adxlAxisY", "adxlAxisZ", "adxlAxisM"],
+            BNO: ["bnoEnabled", "bnoRate"],
+            ADC: ["adcEnabled", "adcRate"]
+        };
+
+        Object.entries(sensorControlIds).forEach(([sensor, controlIds]) => {
+            const disabled = enabledSensors[sensor] === false;
+            controlIds.forEach((controlId) => {
+                const element = document.getElementById(controlId);
+                if (element) {
+                    element.disabled = disabled;
+                }
+            });
+        });
+    }
+
+    function setDebugPeriod() {
+        document.getElementById("period").value = (1 / 60).toFixed(7);
+    }
+
+    function getAdxlAxesMask() {
+        let mask = 0;
+        document.querySelectorAll("[data-axis-bit]").forEach((checkbox) => {
+            if (checkbox.checked) {
+                mask |= Number(checkbox.dataset.axisBit);
+            }
+        });
+        document.getElementById("adxlAxes").value = mask;
+        return mask;
+    }
+
+    function formatAdxlAxes(mask) {
+        const axisNames = [
+            [1, "X"],
+            [2, "Y"],
+            [4, "Z"],
+            [8, "M"]
+        ];
+        const selectedAxes = axisNames
+            .filter(([bit]) => (Number(mask) & bit) !== 0)
+            .map(([, name]) => name);
+        return selectedAxes.length ? selectedAxes.join(", ") : "žádná";
+    }
+
+    function setAdxlAxesMask(mask) {
+        document.querySelectorAll("[data-axis-bit]").forEach((checkbox) => {
+            checkbox.checked = (Number(mask) & Number(checkbox.dataset.axisBit)) !== 0;
+        });
+        document.getElementById("adxlAxes").value = mask;
+    }
+
+    async function refreshCycleStatus() {
+        try {
+            const response = await fetch("/cycle-status");
+            const data = await response.json();
+            if (data.active) {
+                document.getElementById("status").textContent = data.status;
+                setCycleControlsDisabled(true);
+                document.getElementById("stopCycle").hidden = false;
+            } else if (data.status !== "Idle") {
+                document.getElementById("status").textContent = data.status;
+                setCycleControlsDisabled(false);
+                document.getElementById("stopCycle").hidden = true;
+            }
+        } catch (error) {
+            console.error("Nelze načíst stav cyklu:", error);
+        }
+    }
+
+    setInterval(refreshCycleStatus, 1000);
+    applySensorAccess();
+    refreshCycleStatus();
+
+    async function stopMeasurementCycle() {
+        if (!window.confirm("Opravdu chceš ukončit celý měřicí cyklus?")) {
+            return;
+        }
+
+        const response = await fetch("/cycle-stop", {method: "POST"});
+        const data = await response.json();
+        document.getElementById("status").textContent = data.status;
+    }
+
+    async function configure() {
+        const adxlAxes = getAdxlAxesMask();
+        const commands = [
+            `CONF:ADXL ${document.getElementById("adxlEnabled").checked ? "ON" : "OFF"},${document.getElementById("adxlRate").value},${adxlAxes}`,
+            `CONF:BNO ${document.getElementById("bnoEnabled").checked ? "ON" : "OFF"},${document.getElementById("bnoRate").value}`,
+            `CONF:ADC ${document.getElementById("adcEnabled").checked ? "ON" : "OFF"},${document.getElementById("adcRate").value}`
+        ];
+
+        const response = await fetch("/configure", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({config: commands})
+        });
+        const data = await response.json();
+        document.getElementById("status").textContent = data.status;
+        await showConfiguration(true);
+    }
+
+    async function startMeasurement() {
+        const deleteOldFiles = window.confirm(
+            "Chceš před zahájením cyklu smazat všechna uložená měření (.bin a .csv)?"
+        );
+
+        if (deleteOldFiles) {
+            const clearResponse = await fetch("/files/clear", {method: "POST"});
+            const clearData = await clearResponse.json();
+            if (!clearResponse.ok) {
+                document.getElementById("status").textContent = clearData.status;
+                return;
+            }
+        }
+
+        const adxlAxes = getAdxlAxesMask();
+        const config = [
+            `CONF:ADXL ${document.getElementById("adxlEnabled").checked ? "ON" : "OFF"},${document.getElementById("adxlRate").value},${adxlAxes}`,
+            `CONF:BNO ${document.getElementById("bnoEnabled").checked ? "ON" : "OFF"},${document.getElementById("bnoRate").value}`,
+            `CONF:ADC ${document.getElementById("adcEnabled").checked ? "ON" : "OFF"},${document.getElementById("adcRate").value}`
+        ];
+
+        const response = await fetch("/measure", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({
+                address: document.getElementById("address").value,
+                period: Number(document.getElementById("period").value),
+                duration: Number(document.getElementById("duration").value),
+                config
+            })
+        });
+        const data = await response.json();
+        document.getElementById("status").textContent = data.status;
+        if (response.ok) {
+            setCycleControlsDisabled(true);
+        }
+    }
+
+    async function connectDevice() {
+        const address = document.getElementById("address").value;
+
+        const response = await fetch("/connect", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({address})
+        });
+
+        const data = await response.json();
+        document.getElementById("status").textContent = data.status;
+
+        const timer = setInterval(async () => {
+            const statusResponse = await fetch("/connection-status");
+            const statusData = await statusResponse.json();
+
+            document.getElementById("status").textContent = statusData.status;
+
+            if (statusData.status.startsWith("Connected")) {
+                clearInterval(timer);
+            }
+        }, 2000);
+    }
+    </script>
+</body>
+</html>
