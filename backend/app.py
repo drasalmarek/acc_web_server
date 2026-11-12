@@ -10,6 +10,8 @@ from datetime import datetime
 from pathlib import Path
 import time
 import threading
+import signal
+import sys
 
 from raw_data_parser import process_data_file, save_to_csv
 
@@ -17,6 +19,7 @@ app = Flask(__name__)
 FILE_PACKET_SIZE = 1024
 MEASURED_DATA_DIR = Path(__file__).resolve().parent / "measured_data"
 COMMAND_DELAY_SECONDS = 0.2
+HEARTBEAT_INTERVAL_SECONDS = 1.0
 
 UART_RX_CHAR_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 UART_TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
@@ -41,6 +44,11 @@ class BLEDevice:
         self.address = address
         self.client = None
         self.loop = None
+        self.pending_task = None
+        self.pending_future = None
+        self.pending_task_lock = threading.Lock()
+        self.command_lock = asyncio.Lock()
+        self.heartbeat_task = None
 
     async def connect(self):
         self.client = BleakClient(self.address)
@@ -51,8 +59,13 @@ class BLEDevice:
     async def disconnect(self):
         if self.client:
             try:
+                await self.stop_heartbeat()
                 if self.client.is_connected:
                     add_log(f"Odpojování od zařízení {self.address}")
+                    try:
+                        await self.send_command("POW:OFF")
+                    except Exception as error:
+                        add_log(f"POW:OFF před odpojením selhalo: {error}")
                     try:
                         await self.client.stop_notify(UART_TX_CHAR_UUID)
                     except Exception:
@@ -71,18 +84,75 @@ class BLEDevice:
         if not command.endswith("\n"):
             command += "\n"
 
-        add_log(f"BLE TX: {command.rstrip()}")
-        await self.client.write_gatt_char(
-            UART_RX_CHAR_UUID,
-            command.encode("utf-8")
-        )
-        await asyncio.sleep(COMMAND_DELAY_SECONDS)
+        async with self.command_lock:
+            add_log(f"BLE TX: {command.rstrip()}")
+            await self.client.write_gatt_char(
+                UART_RX_CHAR_UUID,
+                command.encode("utf-8")
+            )
+            await asyncio.sleep(COMMAND_DELAY_SECONDS)
+
+    async def heartbeat(self):
+        while self.client and self.client.is_connected:
+            started_at = time.monotonic()
+            try:
+                await self.send_command("SYST:COMM:HEAR")
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:
+                add_log(f"BLE heartbeat selhal: {error}")
+            elapsed = time.monotonic() - started_at
+            await asyncio.sleep(max(0, HEARTBEAT_INTERVAL_SECONDS - elapsed))
+
+    def start_heartbeat(self):
+        if not self.loop or self.loop.is_closed():
+            raise RuntimeError("BLE event loop is not running")
+        if not self.heartbeat_task or self.heartbeat_task.done():
+            self.heartbeat_task = self.loop.create_task(self.heartbeat())
+
+    async def stop_heartbeat(self):
+        task = self.heartbeat_task
+        self.heartbeat_task = None
+        if task and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def run(self, coroutine):
         if not self.loop or self.loop.is_closed():
             raise RuntimeError("BLE event loop is not running")
         future = asyncio.run_coroutine_threadsafe(coroutine, self.loop)
-        return future.result()
+        with self.pending_task_lock:
+            self.pending_future = future
+        try:
+            return future.result()
+        finally:
+            with self.pending_task_lock:
+                if self.pending_future is future:
+                    self.pending_future = None
+
+    def run_on_loop(self, coroutine):
+        if not self.loop or self.loop.is_closed():
+            raise RuntimeError("BLE event loop is not running")
+
+        task = self.loop.create_task(coroutine)
+        with self.pending_task_lock:
+            self.pending_task = task
+        try:
+            return self.loop.run_until_complete(task)
+        finally:
+            with self.pending_task_lock:
+                if self.pending_task is task:
+                    self.pending_task = None
+
+    def cancel_pending(self):
+        with self.pending_task_lock:
+            task = self.pending_task
+            future = self.pending_future
+            loop = self.loop
+        if task and loop and not loop.is_closed():
+            loop.call_soon_threadsafe(task.cancel)
+        if future:
+            future.cancel()
 
     def disconnect_sync(self):
         loop = self.loop
@@ -192,7 +262,10 @@ pending_config_key = None
 measurement_sd_ready_event = None
 file_receiver = FileReceiver()
 control_rx_buffer = bytearray()
+sd_response_buffer = bytearray()
 archive_lock = threading.Lock()
+shutdown_lock = threading.Lock()
+shutdown_started = False
 
 
 def add_log(message):
@@ -200,6 +273,34 @@ def add_log(message):
     with log_lock:
         log_entries.append(entry)
     print(entry, flush=True)
+
+
+def handle_shutdown(signum, frame):
+    global shutdown_started
+
+    with shutdown_lock:
+        if shutdown_started:
+            return
+        shutdown_started = True
+
+    signal_name = signal.Signals(signum).name
+    add_log(f"Ukončuji aplikaci ({signal_name}), vypínám zařízení")
+    cycle_stop_event.set()
+
+    device = ble_device
+    if device and device.client and device.client.is_connected:
+        try:
+            if device.loop and device.loop.is_running():
+                future = asyncio.run_coroutine_threadsafe(
+                    device.disconnect(), device.loop
+                )
+                future.result(timeout=10)
+            else:
+                add_log("BLE event loop při ukončování neběží, odpojení dokončí worker")
+        except Exception as error:
+            add_log(f"BLE odpojení při ukončování selhalo: {error}")
+
+    sys.exit(0)
 
 
 def filter_enabled_sensor_commands(config_commands):
@@ -214,7 +315,7 @@ def filter_enabled_sensor_commands(config_commands):
 
 
 def ble_notification_callback(sender, data):
-    global pending_config_key, measurement_sd_ready_event, control_rx_buffer
+    global pending_config_key, measurement_sd_ready_event, control_rx_buffer, sd_response_buffer
 
     raw_data = bytes(data)
 
@@ -232,6 +333,14 @@ def ble_notification_callback(sender, data):
     add_log(f"BLE RX ({sender}): {text}")
 
     control_rx_buffer.extend(raw_data)
+    sd_response_buffer.extend(raw_data)
+    if len(sd_response_buffer) > 64:
+        del sd_response_buffer[:-64]
+    if re.search(rb"SD\s+Init\s+OK", sd_response_buffer, re.IGNORECASE):
+        add_log("SD karta inicializována")
+        if measurement_sd_ready_event is not None:
+            measurement_sd_ready_event.set()
+
     while b"\n" in control_rx_buffer:
         line_raw, remainder = control_rx_buffer.split(b"\n", 1)
         control_rx_buffer = bytearray(remainder)
@@ -251,23 +360,18 @@ def ble_notification_callback(sender, data):
         if "File receive complete" in line:
             file_receiver.finish()
 
-    if "SD Init OK" in text:
-        add_log("SD karta inicializována")
-        if measurement_sd_ready_event is not None:
-            measurement_sd_ready_event.set()
-
-    # Odpověď na CONF:xxx? má formát například 1,400,6 nebo 0,400.
-    with configuration_lock:
-        key = pending_config_key
-        if key:
-            match = re.search(r"\b([01])\s*,\s*(\d+)(?:\s*,\s*(1[0-5]|[0-9]))?\b", text)
-            if match:
-                configuration_feedback[key] = {
-                    "enabled": bool(int(match.group(1))),
-                    "rate": int(match.group(2)),
-                    "axes": int(match.group(3)) if match.group(3) is not None else None,
-                }
-                add_log(f"Aktuální konfigurace {key}: {configuration_feedback[key]}")
+        # Odpověď na CONF:xxx? má formát například 1,400,6 nebo 0,400.
+        with configuration_lock:
+            key = pending_config_key
+            if key:
+                match = re.search(r"\b([01])\s*,\s*(\d+)(?:\s*,\s*(1[0-5]|[0-9]))?\b", line)
+                if match:
+                    configuration_feedback[key] = {
+                        "enabled": bool(int(match.group(1))),
+                        "rate": int(match.group(2)),
+                        "axes": int(match.group(3)) if match.group(3) is not None else None,
+                    }
+                    add_log(f"Aktuální konfigurace {key}: {configuration_feedback[key]}")
 
 
 def connection_worker(address):
@@ -278,11 +382,13 @@ def connection_worker(address):
         asyncio.set_event_loop(loop)
         device = BLEDevice(address)
         device.loop = loop
+        ble_device = device
         try:
             connection_status = f"Connecting to {address}..."
             add_log(f"Připojování k zařízení {address}")
 
             loop.run_until_complete(device.connect())
+            device.start_heartbeat()
 
             while not device.client.is_connected:
                 time.sleep(0.1)
@@ -390,6 +496,10 @@ def stop_cycle():
             return jsonify({"status": "No active measurement cycle"}), 400
         cycle_stop_event.set()
         cycle_status = "Stopping measurement cycle"
+
+    device = ble_device
+    if device:
+        device.cancel_pending()
 
     add_log("Požadavek na zastavení měřicího cyklu")
     return jsonify({"status": "Measurement cycle is stopping"})
@@ -571,19 +681,13 @@ def measure():
             cycle_status = "Idle"
         return jsonify({"status": "Device not connected"}), 400
 
-    # Zařízení se po POW:OFF může samo vypnout, takže následný disconnect
-    # může ve Windows skončit chybou zrušené operace. To není důvod cyklus zrušit.
     device = ble_device
     device_address = device.address
-    add_log("Start cyklu: posílám POW:OFF a odpojuji BLE")
-    try:
-        device.run(device.send_command("POW:OFF"))
-    except Exception as error:
-        add_log(f"POW:OFF se nepodařilo potvrdit: {error}")
+    add_log("Start cyklu: odpojuji BLE")
     try:
         device.disconnect_sync()
     except Exception as error:
-        add_log(f"BLE odpojení po POW:OFF nebylo potvrzeno: {error}")
+        add_log(f"BLE odpojení nebylo potvrzeno: {error}")
     ble_device = None
     connection_status = "Disconnected; measurement cycle scheduled"
 
@@ -623,7 +727,7 @@ def measurement_cycle_worker(address, duration, period, config_commands, initial
 
 def run_measurement_once(address, duration, config_commands):
     global ble_device, connection_status, cycle_active, cycle_status
-    global measurement_sd_ready_event
+    global measurement_sd_ready_event, control_rx_buffer, sd_response_buffer
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
@@ -638,9 +742,13 @@ def run_measurement_once(address, duration, config_commands):
                 add_log(f"Měření: připojování k zařízení {address}")
                 device = BLEDevice(address)
                 device.loop = loop
+                ble_device = device
                 measurement_sd_ready_event = threading.Event()
-                loop.run_until_complete(device.connect())
-                loop.run_until_complete(device.send_command("POW:ON"))
+                control_rx_buffer = bytearray()
+                sd_response_buffer = bytearray()
+                device.run_on_loop(device.connect())
+                device.start_heartbeat()
+                device.run_on_loop(device.send_command("POW:ON"))
                 add_log("Měření: POW:ON odesláno")
 
                 cycle_status = "Waiting for SD Init OK"
@@ -654,11 +762,7 @@ def run_measurement_once(address, duration, config_commands):
 
                 add_log("Měření: SD Init OK nepřišlo do 60 s, opakuji připojení")
                 try:
-                    loop.run_until_complete(device.send_command("POW:OFF"))
-                except Exception as error:
-                    add_log(f"Měření: POW:OFF při timeoutu selhalo: {error}")
-                try:
-                    loop.run_until_complete(device.disconnect())
+                    device.run_on_loop(device.disconnect())
                 except Exception as error:
                     add_log(f"Měření: odpojení po timeoutu nebylo potvrzeno: {error}")
                 measurement_sd_ready_event = None
@@ -668,7 +772,7 @@ def run_measurement_once(address, duration, config_commands):
                 add_log(f"Měření: připojení selhalo: {error}. Opakuji za 3 s")
                 try:
                     if device and device.client:
-                        loop.run_until_complete(device.disconnect())
+                        device.run_on_loop(device.disconnect())
                 except Exception:
                     pass
                 if cycle_stop_event.wait(3):
@@ -682,12 +786,12 @@ def run_measurement_once(address, duration, config_commands):
         connection_status = f"Connected to {address} for measurement"
 
         for command in config_commands:
-            loop.run_until_complete(device.send_command(command))
+            device.run_on_loop(device.send_command(command))
         add_log("Měření: konfigurace snímačů odeslána")
 
         # Start the measurement
         measurement_filename = datetime.now().strftime("measurement_%Y_%m_%d_%H_%M_%S")
-        loop.run_until_complete(
+        device.run_on_loop(
             device.send_command(f"MEAS:START {measurement_filename}")
         )
 
@@ -696,9 +800,17 @@ def run_measurement_once(address, duration, config_commands):
         add_log(f"Měření: MEAS:START odesláno, soubor {measurement_filename}")
         measurement_deadline = time.monotonic() + duration * 60
         while not cycle_stop_event.is_set() and time.monotonic() < measurement_deadline:
+            if not device.client or not device.client.is_connected:
+                add_log("Měření přerušeno: BLE spojení vypadlo")
+                return
             remaining = measurement_deadline - time.monotonic()
             loop.run_until_complete(asyncio.sleep(min(0.2, max(0, remaining))))
-        loop.run_until_complete(device.send_command("MEAS:STOP"))
+
+        if not device.client or not device.client.is_connected:
+            add_log("Měření přerušeno před MEAS:STOP: BLE spojení vypadlo")
+            return
+
+        device.run_on_loop(device.send_command("MEAS:STOP"))
         add_log("Měření: MEAS:STOP odesláno")
 
         if cycle_stop_event.is_set():
@@ -708,7 +820,7 @@ def run_measurement_once(address, duration, config_commands):
         # Read the measurement file from the device
         file_receiver.prepare(measurement_filename)
         cycle_status = "Downloading measurement file"
-        loop.run_until_complete(
+        device.run_on_loop(
             device.send_command(f"FIL:READ? {measurement_filename},bin")
         )
         add_log(f"Měření: FIL:READ? odesláno pro soubor {measurement_filename}")
@@ -719,11 +831,20 @@ def run_measurement_once(address, duration, config_commands):
             and not file_receiver.complete_event.is_set()
             and time.monotonic() < download_deadline
         ):
+            if not device.client or not device.client.is_connected:
+                file_receiver.abort(delete_file=True)
+                add_log("Stahování přerušeno: BLE spojení vypadlo")
+                return
             loop.run_until_complete(asyncio.sleep(0.1))
 
         if cycle_stop_event.is_set():
             file_receiver.abort(delete_file=True)
             add_log("Stahování přerušeno uživatelem")
+            return
+
+        if not device.client or not device.client.is_connected:
+            file_receiver.abort(delete_file=True)
+            add_log("Stahování přerušeno: BLE spojení vypadlo")
             return
 
         # Check if the file transfer completed successfully
@@ -750,14 +871,9 @@ def run_measurement_once(address, duration, config_commands):
 
         # Turn off the device and disconnect
         try:
-            loop.run_until_complete(device.send_command("POW:OFF"))
-            add_log("Měření: POW:OFF odesláno")
+            device.run_on_loop(device.disconnect())
         except Exception as error:
-            add_log(f"Měření: POW:OFF nebylo možné potvrdit, zařízení se možná již vypnulo: {error}")
-        try:
-            loop.run_until_complete(device.disconnect())
-        except Exception as error:
-            add_log(f"BLE odpojení po POW:OFF nebylo potvrzeno: {error}")
+            add_log(f"BLE odpojení nebylo potvrzeno: {error}")
         connection_status = "Disconnected"
         cycle_status = "Measurement complete"
         add_log(f"Měření dokončeno: {address}")
@@ -767,15 +883,19 @@ def run_measurement_once(address, duration, config_commands):
         add_log(f"Měření selhalo: {error}")
         try:
             if device.client:
-                loop.run_until_complete(device.disconnect())
+                device.run_on_loop(device.disconnect())
         except Exception:
             pass
+    except asyncio.CancelledError:
+        if not cycle_stop_event.is_set():
+            raise
+        add_log("Měření přerušeno během čekání na BLE operaci")
     finally:
         if file_receiver.receiving:
             file_receiver.abort(delete_file=True)
         if device and device.client:
             try:
-                loop.run_until_complete(device.disconnect())
+                device.run_on_loop(device.disconnect())
             except Exception as error:
                 add_log(f"BLE úklid po zastavení nebyl potvrzen: {error}")
         ble_device = None
@@ -784,4 +904,6 @@ def run_measurement_once(address, duration, config_commands):
 
 
 if __name__ == "__main__":
+    signal.signal(signal.SIGTERM, handle_shutdown)
+    signal.signal(signal.SIGINT, handle_shutdown)
     app.run(host="0.0.0.0", port=5000, debug=True, use_reloader=False)

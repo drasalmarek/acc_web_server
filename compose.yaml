@@ -4,6 +4,7 @@ services:
       context: .
       dockerfile: backend/Dockerfile
     container_name: acc-control-web
+    stop_grace_period: 20s
     ports:
       - "5000:5000"
     privileged: true
@@ -12,4 +13,4 @@ services:
     volumes:
       - ./backend/measured_data:/app/backend/measured_data
       - /run/dbus:/run/dbus:ro
-    restart: unless-stopped
+    restart: no
